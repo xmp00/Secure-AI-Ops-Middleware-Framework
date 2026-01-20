@@ -1,69 +1,105 @@
 import re
+import argparse
 import sys
+import os
 
 class LogSanitizer:
-    def __init__(self):
-        # 1. Определяем паттерны для вырезания (Regex)
+    def __init__(self, custom_keywords=None):
+        # Статистика для отчета
+        self.stats = {
+            "ips_removed": 0,
+            "emails_removed": 0,
+            "users_redacted": 0,
+            "keywords_redacted": 0
+        }
+
+        # 1. Regex паттерны для PII (Personal Identifiable Information)
         self.patterns = {
-            # IPv4 адреса (защита инфраструктуры)
-            r'\b(?:\d{1,3}\.){3}\d{1,3}\b': '[IP_REDACTED]',
+            # IPv4: ищет 4 группы цифр через точку
+            "ips_removed": (r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[IP_REDACTED]'),
             
-            # Email адреса (защита PII - персональных данных)
-            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b': '[EMAIL_REDACTED]',
+            # Email: стандартный паттерн
+            "emails_removed": (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL_REDACTED]'),
             
-            # Внутренние ID пользователей (пример: user_12345 или uid=500)
-            r'\b(user_id|uid)[=:]?\s*\d+\b': '[USER_ID_REDACTED]',
-            
-            # MAC адреса
-            r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})': '[MAC_REDACTED]'
+            # MAC адреса (часто встречаются в логах инфраструктуры)
+            "macs_removed": (r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})', '[MAC_REDACTED]')
         }
         
-        # 2. Список чувствительных слов (Специфика клиента, например EPO)
-        # Эти слова заменяются на [INTERNAL_HOST]
-        self.sensitive_keywords = [
-            "epo-prod", "opentext-admin", "admin-console", 
-            "internal-db", "secret-key", "eu-zone-01"
+        # 2. Специфичные ключевые слова (чувствительные данные проекта)
+        # Если передали список — используем его, иначе дефолтный (для теста)
+        self.sensitive_keywords = custom_keywords if custom_keywords else [
+            "epo-prod", "admin-secret", "db_password", "internal-vlan"
         ]
 
-    def sanitize_text(self, text):
-        """Проходит по тексту и заменяет чувствительные данные."""
-        cleaned_text = text
+    def sanitize_line(self, line):
+        """Обрабатывает одну строку лога"""
+        clean_line = line
         
-        # Шаг 1: Regex замены
-        for pattern, placeholder in self.patterns.items():
-            cleaned_text = re.sub(pattern, placeholder, cleaned_text)
-            
-        # Шаг 2: Замена ключевых слов (Hostnames / Project names)
+        # Проход по Regex паттернам
+        for stat_key, (pattern, placeholder) in self.patterns.items():
+            # Считаем количество совпадений перед заменой
+            matches = len(re.findall(pattern, clean_line))
+            if matches > 0:
+                self.stats[stat_key] = self.stats.get(stat_key, 0) + matches
+                clean_line = re.sub(pattern, placeholder, clean_line)
+        
+        # Проход по ключевым словам (Case Insensitive)
         for keyword in self.sensitive_keywords:
-            # (?i) делает поиск регистронезависимым
-            cleaned_text = re.sub(r'(?i)' + re.escape(keyword), '[INTERNAL_ASSET]', cleaned_text)
-            
-        return cleaned_text
+            if keyword.lower() in clean_line.lower():
+                # Считаем вхождения
+                count = clean_line.lower().count(keyword.lower())
+                self.stats["keywords_redacted"] += count
+                
+                # Заменяем (экранируем спецсимволы в keyword на всякий случай)
+                clean_line = re.sub(r'(?i)' + re.escape(keyword), '[INTERNAL_SECRET]', clean_line)
+                
+        return clean_line
 
-    def process_file(self, input_file, output_file):
+    def process_file(self, input_path, output_path):
+        if not os.path.exists(input_path):
+            print(f"❌ Error: Input file '{input_path}' not found.")
+            return False
+
         try:
-            with open(input_file, 'r', encoding='utf-8', errors='ignore') as f_in:
-                content = f_in.read()
+            with open(input_path, 'r', encoding='utf-8', errors='replace') as f_in, \
+                 open(output_path, 'w', encoding='utf-8') as f_out:
                 
-            safe_content = self.sanitize_text(content)
+                print(f"🔄 Processing {input_path}...")
+                
+                for line in f_in:
+                    safe_line = self.sanitize_line(line)
+                    f_out.write(safe_line)
             
-            with open(output_file, 'w', encoding='utf-8') as f_out:
-                f_out.write(safe_content)
-                
-            print(f"✅ Success. Cleaned log saved to: {output_file}")
-            print(f"🔒 Sensitive data removed. Ready for LLM analysis.")
+            return True
             
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Critical Error: {e}")
+            return False
+
+    def print_stats(self):
+        print("\n📊 Sanitization Report:")
+        print("-" * 30)
+        for key, value in self.stats.items():
+            if value > 0:
+                print(f"   ✅ {key.replace('_', ' ').title()}: {value}")
+        print("-" * 30)
 
 if __name__ == "__main__":
-    # Простой запуск: python log_sanitizer.py error.log
-    if len(sys.argv) < 2:
-        print("Usage: python log_sanitizer.py <logfile>")
-        sys.exit(1)
-        
-    input_log = sys.argv[1]
-    output_log = input_log + ".clean.txt"
+    # Настройка аргументов командной строки (как у взрослых утилит)
+    parser = argparse.ArgumentParser(description="Secure AI-Ops Log Sanitizer")
+    parser.add_argument("input_file", help="Path to the raw log file")
+    parser.add_argument("--output", help="Path to save sanitized log", default=None)
     
+    args = parser.parse_args()
+    
+    # Если output не задан, добавляем .clean к имени файла
+    output_file = args.output if args.output else args.input_file + ".clean"
+
     sanitizer = LogSanitizer()
-    sanitizer.process_file(input_log, output_log)
+    success = sanitizer.process_file(args.input_file, output_file)
+    
+    if success:
+        sanitizer.print_stats()
+        print(f"💾 Saved to: {output_file}")
+    else:
+        sys.exit(1)
